@@ -40,7 +40,10 @@ class InputInjectionBlock(nn.Module):
         self.W_cov = nn.Linear(covariate_dim, hidden_dim)
         self.ffn = FFN(2 * hidden_dim, hidden_dim, d_model)
         
-    def forward(self, token_embeddings: torch.Tensor, past_covariates: torch.Tensor) -> torch.Tensor:
+    def forward(self, token_embeddings: torch.Tensor, past_covariates: torch.Tensor = None) -> torch.Tensor:
+        if past_covariates is None:
+            return token_embeddings
+
         # Handle device placement
         if token_embeddings.device != past_covariates.device:
             past_covariates = past_covariates.to(token_embeddings.device)
@@ -80,12 +83,21 @@ class OutputInjectionBlock(nn.Module):
         self.covariate_dim = covariate_dim
         self.output_dim = output_dim
         
+        # For covariate injection
         self.W_out = nn.Linear(d_model, hidden_dim)
         self.W_cov = nn.Linear(covariate_dim, hidden_dim)
         self.ffn = FFN(2 * hidden_dim, hidden_dim, output_dim)
         
-    def forward(self, hidden_states: torch.Tensor, future_covariates: torch.Tensor, 
-                original_outputs: torch.Tensor) -> torch.Tensor:
+        # For forecasting head (when no future covariates)
+        self.forecasting_head = nn.Linear(d_model, output_dim)
+
+    def forward(self, hidden_states: torch.Tensor, future_covariates: torch.Tensor = None, 
+                original_outputs: torch.Tensor = None) -> torch.Tensor:
+        # Case 1: No future covariates - act as a forecasting head
+        if future_covariates is None:
+            return original_outputs
+
+        # Case 2: Future covariates available - do injection
         # Handle device placement
         if hidden_states.device != future_covariates.device:
             future_covariates = future_covariates.to(hidden_states.device)
@@ -116,7 +128,7 @@ class OutputInjectionBlock(nn.Module):
                 batch_size = original_outputs.shape[0]
                 adjustment = adjustment.view(batch_size, -1, original_outputs.shape[-1])
         
-        # Add adjustment to original outputs
+        # Add adjustment to original outputs to get the logits
         # fOIB(zt−1, xt) = hout(zt−1)Wout + gOIB(hout(zt−1), xt)
         return original_outputs + adjustment
 
@@ -128,36 +140,26 @@ class XAdaptor(nn.Module):
                  d_model: int,
                  covariate_dim: int,
                  output_dim: int,
-                 hidden_dim: int = 256,
-                 use_past_covariates: bool = True,
-                 use_future_covariates: bool = False):
+                 hidden_dim: int = 256):
         super().__init__()
         
-        self.use_past_covariates = use_past_covariates
-        self.use_future_covariates = use_future_covariates
         self.covariate_dim = covariate_dim
         
         # Initialize injection blocks based on configuration
-        if use_past_covariates:
-            self.input_injection = InputInjectionBlock(d_model, covariate_dim, hidden_dim)
-        
-        if use_future_covariates:
-            self.output_injection = OutputInjectionBlock(d_model, covariate_dim, output_dim, hidden_dim)
+        self.input_injection = InputInjectionBlock(d_model, covariate_dim, hidden_dim)
+        self.output_injection = OutputInjectionBlock(d_model, covariate_dim, output_dim, hidden_dim)
     
     def inject_input_covariates(self, token_embeddings: torch.Tensor, 
                                past_covariates: torch.Tensor) -> torch.Tensor:
-        """Apply Input Injection Block if enabled"""
-        if self.use_past_covariates and hasattr(self, 'input_injection'):
-            return self.input_injection(token_embeddings, past_covariates)
-        return token_embeddings
+        """Apply Input Injection Block"""
+        return self.input_injection(token_embeddings, past_covariates)
     
     def inject_output_covariates(self, hidden_states: torch.Tensor,
                                 future_covariates: torch.Tensor,
                                 original_outputs: torch.Tensor) -> torch.Tensor:
-        """Apply Output Injection Block if enabled"""
-        if self.use_future_covariates and hasattr(self, 'output_injection'):
-            return self.output_injection(hidden_states, future_covariates, original_outputs)
-        return original_outputs
+        """Apply Output Injection Block"""
+        return self.output_injection(hidden_states, future_covariates, original_outputs)
+
 
 # Universal model class
 class AdaptedXModel(nn.Module):
@@ -167,9 +169,10 @@ class AdaptedXModel(nn.Module):
                  model_wrapper: ModelWrapper,
                  covariate_dim: int,
                  hidden_dim: int = 256,
-                 use_past_covariates: bool = True,
-                 use_future_covariates: bool = False,
-                 freeze_pretrained: bool = True):
+                 freeze_pretrained: bool = True,
+                 temperature: float = 1.0,
+                 top_k: int = None,
+                 num_samples: int = 20):
         super().__init__()
         
         self.model_wrapper = model_wrapper
@@ -177,8 +180,6 @@ class AdaptedXModel(nn.Module):
         self.model_type = model_wrapper.model_type
         self.covariate_dim = covariate_dim
         self.hidden_dim = hidden_dim
-        self.use_past_covariates = use_past_covariates
-        self.use_future_covariates = use_future_covariates
         
         # Freeze pretrained model parameters if specified
         if freeze_pretrained:
@@ -197,13 +198,81 @@ class AdaptedXModel(nn.Module):
             covariate_dim=covariate_dim,
             output_dim=model_wrapper.output_dim,
             hidden_dim=hidden_dim,
-            use_past_covariates=use_past_covariates,
-            use_future_covariates=use_future_covariates
         )
         
         # Store base model path for reconstruction
         self._base_model_path = None
-    
+
+        # Sampling parameters
+        self.temperature = temperature
+        self.top_k = top_k
+        self.num_samples = num_samples
+
+    def sample_from_categorical(self, logits):
+        # Apply temperature scaling
+        logits = logits / self.temperature
+        
+        # Top-k filtering
+        if self.top_k is not None:
+            top_k_logits, top_k_indices = torch.topk(logits, self.top_k, dim=-1)
+            mask = torch.zeros_like(logits).scatter_(-1, top_k_indices, 1)
+            logits = logits * mask + (1 - mask) * (-1e9)
+        
+        # Convert to probabilities
+        probs = F.softmax(logits, dim=-1)
+        
+        # Sample token indices
+        samples = torch.multinomial(probs.view(-1, probs.size(-1)), 1)
+        
+        return samples
+
+    def autoregressive_sample(self, embeddings, additional_info, future_covariates, **kwargs):
+        batch_size = embeddings.shape[0]
+        prediction_length = self.model_wrapper.output_dim
+        
+        # Result container for all samples and logits
+        all_samples = torch.zeros(batch_size, 50, prediction_length)
+        all_logits = torch.zeros(batch_size, 50, prediction_length)
+        
+        # Generate 50 independent trajectories
+        for sample_idx in range(50):
+            # Start each trajectory from same initial state
+            current_context = embeddings.clone()  # (16, 512, 512)  
+            trajectory_tokens = []
+            trajectory_logits = []
+            
+            # Generate tokens autoregressively for current trajectory
+            for step in range(prediction_length):
+                # Forward pass
+                hidden_states, logits = self.model_wrapper.forward_with_embeddings(
+                    current_context, additional_info
+                )
+                
+                # Apply output injection
+                adjusted_logits = self.covariate_adapter.inject_output_covariates(
+                    hidden_states, future_covariates, logits
+                )
+                
+                # Random sampling creates the independence
+                next_token = self.sample_from_categorical(adjusted_logits)  # (16,)
+                trajectory_tokens.append(next_token)
+                trajectory_logits.append(adjusted_logits)
+                
+                # Update context for next step in current trajectory
+                next_embeddings = self.model_wrapper.embed_tokens(next_token)
+                current_context = torch.cat([current_context, next_embeddings], dim=1)
+            
+            # Convert current trajectory to real values
+            trajectory_values = self._get_base_model().tokenizer.output_transform(
+                torch.stack(trajectory_tokens, dim=1), additional_info["tokenizer_state"]
+            )
+            
+            # Store current trajectory
+            all_samples[:, sample_idx, :] = trajectory_values
+            all_logits[:, sample_idx, :] = torch.stack(trajectory_logits, dim=1)
+        
+        return all_samples, all_logits  # (16, 50, prediction_length)
+        
     def forward(self, 
                 input_data: torch.Tensor,
                 mask: Optional[torch.Tensor] = None,
@@ -226,25 +295,19 @@ class AdaptedXModel(nn.Module):
             input_data, mask=mask, **kwargs
         )
         
-        # Apply Input Injection Block if past covariates provided
-        if past_covariates is not None:
-            embeddings = self.covariate_adapter.inject_input_covariates(
-                embeddings, past_covariates
-            )
-        
-        # Forward pass through pretrained model
-        hidden_states, outputs = self.model_wrapper.forward_with_embeddings(
-            embeddings, additional_info, **kwargs
+        # Apply Input Injection Block
+        embeddings = self.covariate_adapter.inject_input_covariates(
+            embeddings, past_covariates
         )
         
-        # Apply Output Injection Block if future covariates provided
-        # *** We currently don't want to use future covariates
-        if future_covariates is not None:
-            outputs = self.covariate_adapter.inject_output_covariates(
-                hidden_states, future_covariates, outputs
-            )
-        
-        return outputs
+        # TODO deterministic forecasting?
+        # Autoregressive sampling with forward pass through model and Output Injection Block
+        outputs, logits = self.autoregressive_sample(embeddings, additional_info, future_covariates, **kwargs)
+
+        return {
+            "outputs": outputs,
+            "logits": logits
+        }
     
     def to(self, device: Union[torch.device, str], **kwargs):
         """Moves all model parameters and buffers to the specified device.
@@ -292,8 +355,6 @@ class AdaptedXModel(nn.Module):
             "model_type": self.model_type,
             "covariate_dim": self.covariate_dim,
             "hidden_dim": self.hidden_dim,
-            "use_past_covariates": self.use_past_covariates,
-            "use_future_covariates": self.use_future_covariates,
             "freeze_pretrained": self.freeze_pretrained,
             "d_model": self.model_wrapper.d_model,
             "output_dim": self.model_wrapper.output_dim
@@ -318,8 +379,6 @@ class AdaptedXModel(nn.Module):
             model_type=config["model_type"],
             covariate_dim=config["covariate_dim"],
             hidden_dim=config["hidden_dim"],
-            use_past_covariates=config["use_past_covariates"],
-            use_future_covariates=config["use_future_covariates"],
             freeze_pretrained=config["freeze_pretrained"],
             **kwargs
         )
@@ -339,9 +398,10 @@ def load_adapted_x_model(
     model_type: str,  # "chronos", "timesfm", "chronos_bolt", etc.
     covariate_dim: int,
     hidden_dim: int = 256,
-    use_past_covariates: bool = True,
-    use_future_covariates: bool = False,
     freeze_pretrained: bool = True,
+    num_samples: int = 20,
+    temperature: float = 1.0,
+    top_k: int = None,
     **model_kwargs
 ) -> AdaptedXModel:
     """
@@ -367,9 +427,11 @@ def load_adapted_x_model(
         model_wrapper=model_wrapper,
         covariate_dim=covariate_dim,
         hidden_dim=hidden_dim,
-        use_past_covariates=use_past_covariates,
-        use_future_covariates=use_future_covariates,
-        freeze_pretrained=freeze_pretrained
+        freeze_pretrained=freeze_pretrained,
+        num_samples=num_samples,
+        temperature=temperature,
+        top_k=top_k,
+        **model_kwargs
     )
     
     # Store base model path
@@ -412,52 +474,52 @@ def load_timesfm_model(model_name_or_path: str, **kwargs):
     return MockTimesFMModel()
 
 
-# Example usage
-def example_usage():
-    """Example showing universal usage"""
+# # Example usage
+# def example_usage():
+#     """Example showing universal usage"""
     
-    # Load different models with covariates
-    models = {}
+#     # Load different models with covariates
+#     models = {}
     
-    # Chronos model
-    try:
-        models['chronos'] = load_adapted_x_model(
-            model_name_or_path="amazon/chronos-t5-tiny",
-            model_type="chronos",
-            covariate_dim=5
-        )
-        print("✅ Loaded Chronos model")
-    except Exception as e:
-        print(f"❌ Failed to load Chronos: {e}")
+#     # Chronos model
+#     try:
+#         models['chronos'] = load_adapted_x_model(
+#             model_name_or_path="amazon/chronos-t5-tiny",
+#             model_type="chronos",
+#             covariate_dim=5
+#         )
+#         print("✅ Loaded Chronos model")
+#     except Exception as e:
+#         print(f"❌ Failed to load Chronos: {e}")
     
-    # ChronosBolt model
-    try:
-        models['chronos_bolt'] = load_adapted_x_model(
-            model_name_or_path="amazon/chronos-bolt-tiny",
-            model_type="chronos_bolt",
-            covariate_dim=5
-        )
-        print("✅ Loaded ChronosBolt model")
-    except Exception as e:
-        print(f"❌ Failed to load ChronosBolt: {e.with_traceback()}")
+#     # ChronosBolt model
+#     try:
+#         models['chronos_bolt'] = load_adapted_x_model(
+#             model_name_or_path="amazon/chronos-bolt-tiny",
+#             model_type="chronos_bolt",
+#             covariate_dim=5
+#         )
+#         print("✅ Loaded ChronosBolt model")
+#     except Exception as e:
+#         print(f"❌ Failed to load ChronosBolt: {e.with_traceback()}")
     
-    # TimesFM model
-    try:
-        models['timesfm'] = load_adapted_x_model(
-            model_name_or_path="google/timesfm-2.0-500m-pytorch",
-            model_type="timesfm",
-            covariate_dim=5
-        )
-        print("✅ Loaded TimesFM model")
-    except Exception as e:
-        print(f"❌ Failed to load TimesFM: {e}")
+#     # TimesFM model
+#     try:
+#         models['timesfm'] = load_adapted_x_model(
+#             model_name_or_path="google/timesfm-2.0-500m-pytorch",
+#             model_type="timesfm",
+#             covariate_dim=5
+#         )
+#         print("✅ Loaded TimesFM model")
+#     except Exception as e:
+#         print(f"❌ Failed to load TimesFM: {e}")
     
-    # Save and load
-    # for name, model in models.items():
-    #     save_path = f"./my_{name}_model"
-    #     model.save_pretrained(save_path)
-    #     loaded_model = AdaptedXModel.from_pretrained(save_path)
-    #     print(f"✅ Saved and loaded {name} model")
+#     # Save and load
+#     # for name, model in models.items():
+#     #     save_path = f"./my_{name}_model"
+#     #     model.save_pretrained(save_path)
+#     #     loaded_model = AdaptedXModel.from_pretrained(save_path)
+#     #     print(f"✅ Saved and loaded {name} model")
 
-if __name__ == "__main__":
-    example_usage()
+# if __name__ == "__main__":
+#     example_usage()

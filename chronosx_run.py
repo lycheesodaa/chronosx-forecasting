@@ -9,8 +9,6 @@ import logging
 from pathlib import Path
 import json
 from tqdm import tqdm
-import matplotlib.pyplot as plt
-from sklearn.metrics import mean_absolute_error, mean_squared_error
 import warnings
 import os
 
@@ -48,6 +46,7 @@ def run_full_experiment(
         prediction_length=training_config.get("prediction_length", 64),
         train_ratio=data_config.get("train_ratio", 0.6),
         val_ratio=data_config.get("val_ratio", 0.2),
+        test_ratio=data_config.get("test_ratio", None),
         step_size=data_config.get("step_size", 1),
         random_seed=data_config.get("random_seed", 42),
     )
@@ -64,9 +63,10 @@ def run_full_experiment(
         model_type=model_config["model_type"],
         covariate_dim=model_config["covariate_dim"],
         hidden_dim=model_config.get("hidden_dim", 256),
-        use_past_covariates=model_config.get("use_past_covariates", True),
-        use_future_covariates=model_config.get("use_future_covariates", False),
         freeze_pretrained=model_config.get("freeze_pretrained", True),
+        temperature=model_config.get("temperature", 1.0),
+        top_k=model_config.get("top_k", None),
+        num_samples=model_config.get("num_samples", 20)
     )
 
     # Initialize trainer
@@ -93,10 +93,9 @@ def run_full_experiment(
     evaluator = AdaptedXModelEvaluator(model, trainer.device)
 
     # Evaluate model
-    test_metrics = evaluator.evaluate_dataset(
+    test_metrics, predictions, targets = evaluator.evaluate_dataset(
         test_dataset,
         batch_size=training_config.get("batch_size", 32),
-        num_samples=training_config.get("num_eval_samples", 20),
     )
 
     # Generate forecast plots
@@ -105,6 +104,11 @@ def run_full_experiment(
         num_series=5,
         save_path=str(trainer.save_dir / "forecast_plots.png"),
     )
+
+    # Export predictions and targets to a single pandas CSV
+    predictions_df = pd.DataFrame({"predictions": predictions.flatten(), "targets": targets.flatten()})
+    predictions_df.to_csv(str(trainer.save_dir / "predictions.csv"), index=False)
+
 
     # Compile results
     results = {
@@ -222,11 +226,10 @@ if __name__ == "__main__":
     model_config = {
         "base_model_path": "amazon/chronos-t5-small",  # or other supported models
         "model_type": "chronos",
-        "covariate_dim": 5,
+        "covariate_dim": 7,
         "hidden_dim": 256,
-        "use_past_covariates": True,
-        "use_future_covariates": False,
         "freeze_pretrained": True,
+        "num_samples": 50,
     }
 
     training_config = {
@@ -238,13 +241,18 @@ if __name__ == "__main__":
         "device": "cuda" if torch.cuda.is_available() else "cpu",
         "save_dir": "./experiment_results",
         "patience": 10,
-        "num_eval_samples": 50,
     }
 
+    # data_config = {num
+    #     "data_path": "~/models/Time-LLM/dataset/demand/demand_data_all_cleaned_featsel.csv",
+    #     "train_ratio": 0.6,  # 60% training
+    #     "val_ratio": 0.2,  # 20% validation, 20% test (1 - 0.6 - 0.2 = 0.2)
+    # }
     data_config = {
-        "data_path": "models/uni2ts/data/demand_data_all_cleaned_featsel.csv",
-        "train_ratio": 0.6,  # 60% training
-        "val_ratio": 0.2,  # 20% validation, 20% test (1 - 0.6 - 0.2 = 0.2)
+        "data_path": "~/models/Time-LLM/dataset/demand/demand_data_all_cleaned_featsel.csv",
+        "train_ratio": 0.2, # for testing purposes only
+        "val_ratio": 0.1,
+        "test_ratio": 0.1,
     }
 
     # Run single experiment
@@ -260,23 +268,23 @@ if __name__ == "__main__":
     for metric, value in results["test_metrics"].items():
         print(f"  {metric}: {value:.6f}")
 
-    # Run hyperparameter search
-    print("\nRunning hyperparameter search...")
-    param_grid = {
-        "learning_rate": [1e-4, 5e-4, 1e-3, 5e-3],
-        "batch_size": [8, 16, 32],
-        "hidden_dim": [128, 256, 512],
-    }
+    # # Run hyperparameter search
+    # print("\nRunning hyperparameter search...")
+    # param_grid = {
+    #     "learning_rate": [1e-4, 5e-4, 1e-3, 5e-3],
+    #     "batch_size": [8, 16, 32],
+    #     "hidden_dim": [128, 256, 512],
+    # }
 
-    hp_results = hyperparameter_search(
-        base_model_config=model_config,
-        base_data_config=data_config,
-        param_grid=param_grid,
-        n_trials=5,  # Reduced for example
-    )
+    # hp_results = hyperparameter_search(
+    #     base_model_config=model_config,
+    #     base_data_config=data_config,
+    #     param_grid=param_grid,
+    #     n_trials=5,  # Reduced for example
+    # )
 
-    print(f"\nBest hyperparameters: {hp_results['best_config']}")
-    print(f"Best validation loss: {hp_results['best_score']:.6f}")
+    # print(f"\nBest hyperparameters: {hp_results['best_config']}")
+    # print(f"Best validation loss: {hp_results['best_score']:.6f}")
 
 
 # Additional utility functions for advanced evaluation
@@ -384,13 +392,9 @@ if __name__ == "__main__":
 
 #     ablation_configs = {
 #         'full_model': base_model_config,
-#         'no_past_covariates': {**base_model_config, 'use_past_covariates': False},
-#         'no_future_covariates': {**base_model_config, 'use_future_covariates': False},
-#         'no_covariates': {
-#             **base_model_config,
-#             'use_past_covariates': False,
-#             'use_future_covariates': False
-#         },
+#         'no_past_covariates': {**base_model_config},
+#         'no_future_covariates': {**base_model_config},
+#         'no_covariates': {**base_model_config},
 #         'small_hidden': {**base_model_config, 'hidden_dim': 64},
 #         'large_hidden': {**base_model_config, 'hidden_dim': 512}
 #     }

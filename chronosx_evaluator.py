@@ -5,7 +5,9 @@ from typing import Dict, List, Tuple, Optional, Any
 import logging
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.metrics import mean_absolute_error, mean_squared_error, mean_absolute_percentage_error
+
+from chronosx_covariate_ds import TimeSeriesCovariateDataset
 
 class AdaptedXModelEvaluator:
     """
@@ -29,7 +31,6 @@ class AdaptedXModelEvaluator:
         self,
         test_dataset: TimeSeriesCovariateDataset,
         batch_size: int = 32,
-        num_samples: int = 20,
     ) -> Dict[str, float]:
         """
         Evaluate model on a test dataset.
@@ -65,33 +66,35 @@ class AdaptedXModelEvaluator:
                 try:
                     # Generate multiple samples for probabilistic evaluation
                     batch_predictions = []
-                    for _ in range(num_samples):
-                        outputs = self.model(
-                            input_data=batch["input_data"],
-                            mask=batch["mask"],
-                            past_covariates=batch["past_covariates"],
-                            future_covariates=batch["future_covariates"],
-                        )
+                    outputs = self.model(
+                        input_data=batch["input_data"],
+                        mask=batch["mask"],
+                        past_covariates=batch["past_covariates"],
+                        future_covariates=batch["future_covariates"],
+                    )
 
-                        # Extract predictions
-                        if hasattr(outputs, "prediction_outputs"):
-                            preds = outputs.prediction_outputs
-                        elif hasattr(outputs, "logits"):
-                            preds = outputs.logits
-                        else:
-                            preds = outputs
+                    # Extract predictions
+                    if hasattr(outputs, "outputs"):
+                        preds = outputs.outputs
+                    elif hasattr(outputs, "logits"):
+                        preds = outputs.logits
+                    else:
+                        preds = outputs
+                    print(preds.shape)
 
-                        # Handle shape mismatches
-                        if len(preds.shape) == 3 and len(batch["target"].shape) == 2:
-                            preds = preds.mean(dim=1)
+                    # Handle shape mismatches
+                    if len(preds.shape) == 3 and len(batch["target"].shape) == 2:
+                        preds = preds.mean(dim=1)
 
-                        batch_predictions.append(preds.cpu())
+                    batch_predictions.append(preds.cpu())
+                    print(batch_predictions.shape)
 
                     # Stack predictions: [num_samples, batch_size, prediction_length]
                     batch_predictions = torch.stack(batch_predictions)
                     targets = batch["target"].cpu()
 
                     all_predictions.append(batch_predictions)
+                    print(all_predictions.shape)
                     all_targets.append(targets)
 
                     # Calculate errors for this batch
@@ -112,7 +115,7 @@ class AdaptedXModelEvaluator:
         # Calculate metrics
         metrics = self._calculate_metrics(all_predictions, all_targets)
 
-        return metrics
+        return metrics, all_predictions, all_targets
 
     def _collate_fn(self, batch):
         """Custom collate function."""
@@ -149,6 +152,7 @@ class AdaptedXModelEvaluator:
 
         # Point forecast metrics
         mae = mean_absolute_error(targets_flat, mean_pred_flat)
+        mape = mean_absolute_percentage_error(targets_flat, mean_pred_flat)
         mse = mean_squared_error(targets_flat, mean_pred_flat)
         rmse = np.sqrt(mse)
 
@@ -191,6 +195,7 @@ class AdaptedXModelEvaluator:
 
         metrics = {
             "MAE": mae,
+            "MAPE": mape,
             "MSE": mse,
             "RMSE": rmse,
             "MASE": mase,

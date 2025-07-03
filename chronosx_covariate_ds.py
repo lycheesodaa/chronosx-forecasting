@@ -25,6 +25,7 @@ class TimeSeriesCovariateDataset(Dataset):
         prediction_length: int = 64,
         train_ratio: float = 0.6,
         val_ratio: float = 0.2,
+        test_ratio: float = None,
         step_size: int = 1,
         min_past: int = 64,
         random_seed: Optional[int] = None,
@@ -57,7 +58,7 @@ class TimeSeriesCovariateDataset(Dataset):
 
         # Load and process data
         self._load_data(data_source, target_column, covariate_columns)
-        self._create_overlapping_splits(train_ratio, val_ratio)
+        self._create_overlapping_splits(train_ratio, val_ratio, test_ratio)
         self._extract_mode_data()
         self._create_sliding_windows()
         self._validate_dataset()
@@ -128,13 +129,13 @@ class TimeSeriesCovariateDataset(Dataset):
             f"Past covariates shape: {self.past_covariates.shape if self.past_covariates is not None else None}"
         )
 
-    def _create_overlapping_splits(self, train_ratio: float, val_ratio: float):
+    def _create_overlapping_splits(self, train_ratio: float, val_ratio: float, test_ratio: float = None):
         """
         Create overlapping train/val/test splits that allow validation and test
         to extend context_length into previous data.
         """
         n_total = len(self.time_series)
-        test_ratio = 1.0 - train_ratio - val_ratio
+        test_ratio = 1.0 - train_ratio - val_ratio if test_ratio is None else test_ratio
 
         if test_ratio <= 0:
             raise ValueError("train_ratio + val_ratio must be < 1.0")
@@ -382,6 +383,8 @@ class TimeSeriesCovariateDataset(Dataset):
                 padding = np.zeros((padding_size, past_cov.shape[-1]))
                 past_cov = np.concatenate([padding, past_cov], axis=0)
 
+        # Whether or not the model uses past covariates (IIB) or future covariates (OIB) 
+        # is automatically handled by the model based on whether past_covariates=None or future_covariates=None 
         return {
             "input_data": torch.FloatTensor(context),
             "target": torch.FloatTensor(target),
@@ -418,6 +421,7 @@ def create_datasets(
     prediction_length: int = 64,
     train_ratio: float = 0.6,
     val_ratio: float = 0.2,
+    test_ratio: float = None,
     step_size: int = 1,
     min_past: int = 64,
     random_seed: Optional[int] = None,
@@ -438,6 +442,7 @@ def create_datasets(
         "prediction_length": prediction_length,
         "train_ratio": train_ratio,
         "val_ratio": val_ratio,
+        "test_ratio": test_ratio,
         "step_size": step_size,
         "min_past": min_past,
         "random_seed": random_seed,
@@ -459,6 +464,7 @@ def create_dataloaders(
     prediction_length: int = 64,
     train_ratio: float = 0.6,
     val_ratio: float = 0.2,
+    test_ratio: float = None,
     step_size: int = 1,
     min_past: int = 64,
     random_seed: Optional[int] = None,
@@ -478,6 +484,7 @@ def create_dataloaders(
         prediction_length=prediction_length,
         train_ratio=train_ratio,
         val_ratio=val_ratio,
+        test_ratio=test_ratio,
         step_size=step_size,
         min_past=min_past,
         random_seed=random_seed,

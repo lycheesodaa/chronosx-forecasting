@@ -8,6 +8,8 @@ from pathlib import Path
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
+from chronosx_covariate_ds import TimeSeriesCovariateDataset
+
 class AdaptedXModelTrainer:
     """
     Trainer class for AdaptedXModel with covariate support.
@@ -89,16 +91,13 @@ class AdaptedXModelTrainer:
 
         return collated
 
-    def _compute_loss(self, outputs, targets, mask=None):
+    def _compute_loss(self, outputs, targets):
         """Compute training loss. This is a simplified version - adapt based on your model's output format."""
-        if hasattr(outputs, "prediction_outputs"):
-            # Handle Chronos-style outputs with prediction_outputs attribute
-            predictions = outputs.prediction_outputs
-        elif hasattr(outputs, "logits"):
-            # Handle transformer-style outputs
+        if hasattr(outputs, "logits"):
             predictions = outputs.logits
+        elif hasattr(outputs, "outputs"):
+            predictions = outputs.outputs
         else:
-            # Assume outputs are direct predictions
             predictions = outputs
 
         # Reshape if needed to match target dimensions
@@ -106,13 +105,10 @@ class AdaptedXModelTrainer:
             # Average across the sequence dimension or take the last prediction
             predictions = predictions.mean(dim=1)
 
-        print(
-            f"Predictions device: {predictions.device}, targets device: {targets.device}"
-        )
         assert predictions.device == targets.device
 
-        # Compute MSE loss
-        loss = nn.MSELoss()(predictions, targets)
+        # TODO implement loss function determined by model type
+        loss = nn.CrossEntropyLoss()(predictions, targets) # Chronos uses cross entropy
         return loss
 
     def train_epoch(self):
@@ -141,7 +137,7 @@ class AdaptedXModelTrainer:
                 )
 
                 # Compute loss
-                loss = self._compute_loss(outputs, batch["target"], batch["mask"])
+                loss = self._compute_loss(outputs, batch["target"])
 
                 # Backward pass
                 loss.backward()
@@ -188,7 +184,7 @@ class AdaptedXModelTrainer:
                         future_covariates=batch["future_covariates"],
                     )
 
-                    loss = self._compute_loss(outputs, batch["target"], batch["mask"])
+                    loss = self._compute_loss(outputs, batch["target"])
                     epoch_loss += loss.item()
                     num_batches += 1
 
@@ -261,8 +257,6 @@ class AdaptedXModelTrainer:
             "model_config": {
                 "covariate_dim": self.model.covariate_dim,
                 "hidden_dim": self.model.hidden_dim,
-                "use_past_covariates": self.model.use_past_covariates,
-                "use_future_covariates": self.model.use_future_covariates,
                 "model_type": self.model.model_type,
             },
         }
