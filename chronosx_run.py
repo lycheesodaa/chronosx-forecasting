@@ -64,9 +64,7 @@ def run_full_experiment(
         covariate_dim=model_config["covariate_dim"],
         hidden_dim=model_config.get("hidden_dim", 256),
         freeze_pretrained=model_config.get("freeze_pretrained", True),
-        temperature=model_config.get("temperature", 1.0),
-        top_k=model_config.get("top_k", None),
-        num_samples=model_config.get("num_samples", 20)
+        specific_model_config=model_config.get("specific_model_config", {}),
     )
 
     # Initialize trainer
@@ -108,7 +106,6 @@ def run_full_experiment(
     # Export predictions and targets to a single pandas CSV
     predictions_df = pd.DataFrame({"predictions": predictions.flatten(), "targets": targets.flatten()})
     predictions_df.to_csv(str(trainer.save_dir / "predictions.csv"), index=False)
-
 
     # Compile results
     results = {
@@ -224,12 +221,14 @@ def hyperparameter_search(
 
 if __name__ == "__main__":
     model_config = {
-        "base_model_path": "amazon/chronos-t5-small",  # or other supported models
+        "base_model_path": "amazon/chronos-t5-tiny",  # or other supported models
         "model_type": "chronos",
         "covariate_dim": 7,
         "hidden_dim": 256,
         "freeze_pretrained": True,
-        "num_samples": 50,
+        "specific_model_config": {
+            "num_samples": 50,
+        }
     }
 
     training_config = {

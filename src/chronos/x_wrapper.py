@@ -7,6 +7,7 @@ import torch.nn as nn
 from typing import Any, Tuple, Optional
 from abc import ABC, abstractmethod
 
+from transformers import GenerationConfig
 
 class ModelWrapper(ABC):
     """Abstract base class for model wrappers"""
@@ -62,13 +63,30 @@ class ModelWrapper(ABC):
         """
         pass
 
+    @abstractmethod
+    def post_processing(self, sequences: torch.Tensor, hidden_states: torch.Tensor, 
+                        logits: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        """
+        Performing any necessary processing e.g. converting logits back into outputs
+        """
+        pass
+
 
 # ------------- Modify/add wrappers for models within this section -------------
 class ChronosWrapper(ModelWrapper):
     """Wrapper for Chronos models (T5-based tokenized models)"""
+    from chronos import ChronosPipeline, ChronosTokenizer, ChronosModel
 
-    def __init__(self, chronos_pipeline):
+    chronos_pipeline: ChronosPipeline
+    tokenizer: ChronosTokenizer
+    model: ChronosModel
+
+    def __init__(self, chronos_pipeline, specific_model_config):
         self.chronos_pipeline = chronos_pipeline
+        self.tokenizer = chronos_pipeline.tokenizer
+        self.model = chronos_pipeline.model
+
+        self.model.config.num_samples = specific_model_config.get("num_samples", 20)
 
     def _get_base_model(self):
         """Return the underlying Chronos pipeline instance"""
@@ -81,106 +99,94 @@ class ChronosWrapper(ModelWrapper):
     @property
     def d_model(self) -> int:
         # Get d_model from the model config
-        return self.chronos_pipeline.model.model.config.d_model
+        return self.model.model.config.d_model
 
     @property
     def output_dim(self) -> int:
         # For Chronos, output dimension is based on vocab size and prediction length
-        config = self.chronos_pipeline.model.config
+        config = self.model.config
         return config.prediction_length
 
     def embed_tokens(self, token_ids: torch.Tensor) -> torch.Tensor:
         """Pass to the underlying embed tokens function"""
-        if hasattr(self.chronos_pipeline.model.model, 'encoder'):
-            return self.chronos_pipeline.model.model.encoder.embed_tokens(token_ids)
+        if hasattr(self.model.model, 'encoder'):
+            return self.model.model.encoder.embed_tokens(token_ids)
         else:
-            return self.chronos_pipeline.model.model.embed_tokens(token_ids)
+            return self.model.model.embed_tokens(token_ids)
 
     def get_input_embeddings(self, input_data: torch.Tensor, **kwargs) -> Tuple[torch.Tensor, Any]:
         """Get input embeddings from Chronos tokenizer and model"""
-        # Prepare and validate context
-        context_tensor = self.chronos_pipeline._prepare_and_validate_context(input_data)
+        input_data = input_data.to(self.tokenizer.boundaries.device)
+        embeddings, _ = self.chronos_pipeline.embed(context=input_data)
+        embeddings = embeddings.to(self.model.device)
 
-        # # Replace the tokenizer with our device-aware version if it's not already
-        # if not isinstance(self.chronos_pipeline.tokenizer, DeviceAwareMeanScaleUniformBins):
-        #     # Create a new tokenizer with the same config but device-aware
-        #     config = self.chronos_pipeline.tokenizer.config
-        #     self.chronos_pipeline.tokenizer = DeviceAwareMeanScaleUniformBins(low_limit=-15.0, high_limit=15.0, config=config)
+        return embeddings
 
-        #     # Copy over any necessary state
-        #     if hasattr(self.chronos_pipeline.tokenizer, 'boundaries'):
-        #         self.chronos_pipeline.tokenizer.boundaries = self.chronos_pipeline.tokenizer.boundaries.to(
-        #             context_tensor.device
-        #         )
+    def forward_with_embeddings(self, input_data: torch.Tensor, embeddings: torch.Tensor, 
+                               **kwargs) -> Tuple[torch.Tensor, Tuple[torch.Tensor], torch.Tensor]:
+        """Forward pass with custom embeddings"""
+        input_data = input_data.to(self.tokenizer.boundaries.device)
+        input_ids, attention_mask, scale = self.tokenizer.context_input_transform(
+            input_data
+        )
+        input_ids = input_ids.to(self.model.device)
+        attention_mask = attention_mask.to(self.model.device)
+        self.scale = scale
 
-        if context_tensor.device != self.chronos_pipeline.tokenizer.boundaries.device:
-            context_tensor = context_tensor.to(self.chronos_pipeline.tokenizer.boundaries.device)
+        assert hasattr(self.model.model, "generate")
 
-        # Tokenize using our device-aware tokenizer
-        token_ids, attention_mask, tokenizer_state = (
-            self.chronos_pipeline.tokenizer.context_input_transform(context_tensor)
+        sequences = self.model.model.generate(
+            inputs_embeds=embeddings,
+            attention_mask=attention_mask,
+            generation_config=GenerationConfig(
+                min_new_tokens=self.model.config.prediction_length,
+                max_new_tokens=self.model.config.prediction_length,
+                do_sample=True,
+                num_return_sequences=self.model.config.num_samples,
+                eos_token_id=self.model.config.eos_token_id,
+                pad_token_id=self.model.config.pad_token_id,
+                temperature=self.model.config.temperature,
+                top_k=self.model.config.top_k,
+                top_p=self.model.config.top_p,
+                output_hidden_states=True,
+                output_logits=True,
+                return_dict_in_generate=True,
+            ),
         )
 
-        # Ensure tensors are on the correct device
-        device = self.chronos_pipeline.model.device
-        token_ids = token_ids.to(device)
-        attention_mask = attention_mask.to(device)
+        sequences = outputs.sequences
+        hidden_states = outputs.decoder_hidden_states
+        logits = outputs.logits
 
-        # Get embeddings from the model
-        embeddings = self.embed_tokens(token_ids)
-
-        additional_info = {
-            "attention_mask": attention_mask,
-            "tokenizer_state": tokenizer_state,
-            "token_ids": token_ids
-        }
-
-        return embeddings, additional_info
-
-    def forward_with_embeddings(self, embeddings: torch.Tensor, additional_info: dict, 
-                               **kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass with custom embeddings"""
-        attention_mask = additional_info["attention_mask"]
-
-        # Handle different model types
-        if self.chronos_pipeline.model.config.model_type == "seq2seq":
-            # For T5-based seq2seq models
-            encoder_outputs = self.chronos_pipeline.model.model.encoder(
-                inputs_embeds=embeddings,
-                attention_mask=attention_mask,
-                **kwargs
-            )
-
-            # For T5 decoder, we need to provide decoder_input_ids
-            batch_size = embeddings.shape[0]
-            decoder_input_ids = torch.full(
-                (batch_size, 1),
-                self.chronos_pipeline.model.model.config.decoder_start_token_id,
-                dtype=torch.long,
-                device=embeddings.device,
-            )
-
-            # Get decoder outputs
-            decoder_outputs = self.chronos_pipeline.model.model.decoder(
-                input_ids=decoder_input_ids,
-                encoder_hidden_states=encoder_outputs.last_hidden_state,
-                encoder_attention_mask=attention_mask,
-                **kwargs,
-            )
-            
-            hidden_states = decoder_outputs.last_hidden_state
-            logits = self.chronos_pipeline.model.model.lm_head(hidden_states)
+        if self.model.config.model_type == "seq2seq":
+            sequences = sequences[..., 1:]  # remove the decoder start token
         else:
-            # For causal models
-            outputs = self.chronos_pipeline.model.model(
-                inputs_embeds=embeddings,
-                attention_mask=attention_mask,
-                **kwargs
-            )
-            hidden_states = outputs.last_hidden_state
-            logits = outputs.logits
+            assert self.model.config.model_type == "causal"
+            assert sequences.size(-1) == input_ids.size(-1) + self.model.config.prediction_length
+            sequences = sequences[..., -self.model.config.prediction_length:]
 
-        return hidden_states, logits
+        sequences = sequences.reshape(input_ids.size(0), self.model.config.num_samples, -1)
+
+        # TODO bother with the hidden states and logits when you need the OIB
+        # hidden_states = hidden_states.reshape(input_ids.size(0), self.model.config.num_samples, -1)
+        # logits = logits.reshape(input_ids.size(0), self.model.config.num_samples, -1)
+
+        # print("sequences.shape", sequences.shape)
+        # print("hidden_states.shape", len(hidden_states), len(hidden_states[0]), hidden_states[0][0].shape)
+        # print("logits.shape", len(logits), logits[0].shape)
+
+        return sequences, hidden_states, logits
+
+    def post_processing(self, sequences: torch.Tensor, hidden_states: torch.Tensor, 
+                        logits: torch.Tensor) -> torch.Tensor:
+        """
+        Performing any necessary processing e.g. converting logits back into outputs
+        """
+        output = self.tokenizer.output_transform(
+            sequences.to(self.scale.device), self.scale
+        )
+
+        return output.to(self.model.device).median(dim=1)
 
 
 class ChronosBoltWrapper(ModelWrapper):

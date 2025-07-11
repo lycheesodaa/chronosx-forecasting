@@ -164,23 +164,20 @@ class XAdaptor(nn.Module):
 # Universal model class
 class AdaptedXModel(nn.Module):
     """Universal model that can add covariates to any time series model"""
-    
+
     def __init__(self,
                  model_wrapper: ModelWrapper,
                  covariate_dim: int,
                  hidden_dim: int = 256,
-                 freeze_pretrained: bool = True,
-                 temperature: float = 1.0,
-                 top_k: int = None,
-                 num_samples: int = 20):
+                 freeze_pretrained: bool = True):
         super().__init__()
-        
+
         self.model_wrapper = model_wrapper
         self.freeze_pretrained = freeze_pretrained
         self.model_type = model_wrapper.model_type
         self.covariate_dim = covariate_dim
         self.hidden_dim = hidden_dim
-        
+
         # Freeze pretrained model parameters if specified
         if freeze_pretrained:
             if hasattr(self.model_wrapper._get_base_model(), 'parameters'):
@@ -191,7 +188,7 @@ class AdaptedXModel(nn.Module):
                     param.requires_grad = False
             else:
                 raise ValueError("Unsupported model type. Model does not have parameters?")
-        
+
         # Initialize covariate adapter
         self.covariate_adapter = XAdaptor(
             d_model=model_wrapper.d_model,
@@ -199,80 +196,10 @@ class AdaptedXModel(nn.Module):
             output_dim=model_wrapper.output_dim,
             hidden_dim=hidden_dim,
         )
-        
+
         # Store base model path for reconstruction
         self._base_model_path = None
 
-        # Sampling parameters
-        self.temperature = temperature
-        self.top_k = top_k
-        self.num_samples = num_samples
-
-    def sample_from_categorical(self, logits):
-        # Apply temperature scaling
-        logits = logits / self.temperature
-        
-        # Top-k filtering
-        if self.top_k is not None:
-            top_k_logits, top_k_indices = torch.topk(logits, self.top_k, dim=-1)
-            mask = torch.zeros_like(logits).scatter_(-1, top_k_indices, 1)
-            logits = logits * mask + (1 - mask) * (-1e9)
-        
-        # Convert to probabilities
-        probs = F.softmax(logits, dim=-1)
-        
-        # Sample token indices
-        samples = torch.multinomial(probs.view(-1, probs.size(-1)), 1)
-        
-        return samples
-
-    def autoregressive_sample(self, embeddings, additional_info, future_covariates, **kwargs):
-        batch_size = embeddings.shape[0]
-        prediction_length = self.model_wrapper.output_dim
-        
-        # Result container for all samples and logits
-        all_samples = torch.zeros(batch_size, 50, prediction_length)
-        all_logits = torch.zeros(batch_size, 50, prediction_length)
-        
-        # Generate 50 independent trajectories
-        for sample_idx in range(50):
-            # Start each trajectory from same initial state
-            current_context = embeddings.clone()  # (16, 512, 512)  
-            trajectory_tokens = []
-            trajectory_logits = []
-            
-            # Generate tokens autoregressively for current trajectory
-            for step in range(prediction_length):
-                # Forward pass
-                hidden_states, logits = self.model_wrapper.forward_with_embeddings(
-                    current_context, additional_info
-                )
-                
-                # Apply output injection
-                adjusted_logits = self.covariate_adapter.inject_output_covariates(
-                    hidden_states, future_covariates, logits
-                )
-                
-                # Random sampling creates the independence
-                next_token = self.sample_from_categorical(adjusted_logits)  # (16,)
-                trajectory_tokens.append(next_token)
-                trajectory_logits.append(adjusted_logits)
-                
-                # Update context for next step in current trajectory
-                next_embeddings = self.model_wrapper.embed_tokens(next_token)
-                current_context = torch.cat([current_context, next_embeddings], dim=1)
-            
-            # Convert current trajectory to real values
-            trajectory_values = self._get_base_model().tokenizer.output_transform(
-                torch.stack(trajectory_tokens, dim=1), additional_info["tokenizer_state"]
-            )
-            
-            # Store current trajectory
-            all_samples[:, sample_idx, :] = trajectory_values
-            all_logits[:, sample_idx, :] = torch.stack(trajectory_logits, dim=1)
-        
-        return all_samples, all_logits  # (16, 50, prediction_length)
-        
     def forward(self, 
                 input_data: torch.Tensor,
                 mask: Optional[torch.Tensor] = None,
@@ -280,7 +207,6 @@ class AdaptedXModel(nn.Module):
                 future_covariates: Optional[torch.Tensor] = None,
                 **kwargs) -> torch.Tensor:
         """Universal forward pass"""
-
         # Ensure all inputs are on the same device
         device = input_data.device
         if mask is not None:
@@ -291,24 +217,34 @@ class AdaptedXModel(nn.Module):
             future_covariates = future_covariates.to(device)
 
         # Get initial embeddings
-        embeddings, additional_info = self.model_wrapper.get_input_embeddings(
+        embeddings = self.model_wrapper.get_input_embeddings(
             input_data, mask=mask, **kwargs
         )
-        
+
         # Apply Input Injection Block
         embeddings = self.covariate_adapter.inject_input_covariates(
             embeddings, past_covariates
         )
-        
-        # TODO deterministic forecasting?
-        # Autoregressive sampling with forward pass through model and Output Injection Block
-        outputs, logits = self.autoregressive_sample(embeddings, additional_info, future_covariates, **kwargs)
 
-        return {
-            "outputs": outputs,
-            "logits": logits
-        }
-    
+        # Forward pass through pretrained model
+        sequences, hidden_states, logits = self.model_wrapper.forward_with_embeddings(
+            input_data, embeddings, **kwargs
+        )
+
+        # Apply Output Injection Block if future covariates provided
+        # *** We currently don't want to use future covariates
+        if future_covariates is not None:
+            logits = self.covariate_adapter.inject_output_covariates(
+                hidden_states, future_covariates, logits
+            )
+
+        # Need to convert logits back into outputs
+        outputs = self.model_wrapper.post_processing(
+            sequences, hidden_states, logits
+        )
+
+        return outputs
+
     def to(self, device: Union[torch.device, str], **kwargs):
         """Moves all model parameters and buffers to the specified device.
         
@@ -322,10 +258,10 @@ class AdaptedXModel(nn.Module):
         # Convert device string to torch.device if needed
         if isinstance(device, str):
             device = torch.device(device)
-            
+
         # Call parent's to() method to handle basic parameters and buffers
         super().to(device, **kwargs)
-        
+
         # Move the wrapped model to the device
         if hasattr(self.model_wrapper, '_get_base_model'):
             base_model = self.model_wrapper._get_base_model()
@@ -334,21 +270,21 @@ class AdaptedXModel(nn.Module):
             # Handle special case for ChronosPipeline
             elif hasattr(base_model, 'model') and hasattr(base_model.model, 'to'):
                 base_model.model.to(device, **kwargs)
-        
+
         # Move the covariate adapter
         if hasattr(self, 'covariate_adapter'):
             self.covariate_adapter.to(device, **kwargs)
-            
+
         return self
-        
+
     def save_pretrained(self, save_directory: str):
         """Save the model (only adapter weights + config)"""
         os.makedirs(save_directory, exist_ok=True)
-        
+
         # Save only the adapter weights
         adapter_state_dict = self.covariate_adapter.state_dict()
         torch.save(adapter_state_dict, os.path.join(save_directory, "adapter_weights.bin"))
-        
+
         # Save configuration
         config = {
             "base_model_path": self._base_model_path,
@@ -359,12 +295,12 @@ class AdaptedXModel(nn.Module):
             "d_model": self.model_wrapper.d_model,
             "output_dim": self.model_wrapper.output_dim
         }
-        
+
         with open(os.path.join(save_directory, "config.json"), "w") as f:
             json.dump(config, f, indent=2)
-        
+
         print(f"Universal covariate model saved to {save_directory}")
-    
+
     @classmethod
     def from_pretrained(cls, save_directory: str, **kwargs):
         """Load a saved model"""
@@ -372,7 +308,7 @@ class AdaptedXModel(nn.Module):
         config_path = os.path.join(save_directory, "config.json")
         with open(config_path, "r") as f:
             config = json.load(f)
-        
+
         # Recreate the model using the appropriate loading function
         model = load_adapted_x_model(
             model_name_or_path=config["base_model_path"],
@@ -382,14 +318,14 @@ class AdaptedXModel(nn.Module):
             freeze_pretrained=config["freeze_pretrained"],
             **kwargs
         )
-        
+
         # Load the saved adapter weights
         adapter_weights_path = os.path.join(save_directory, "adapter_weights.bin")
         if os.path.exists(adapter_weights_path):
             adapter_state_dict = torch.load(adapter_weights_path, map_location="cpu")
             model.covariate_adapter.load_state_dict(adapter_state_dict)
             print(f"Loaded adapter weights from {adapter_weights_path}")
-        
+
         return model
 
 # Universal loading function
@@ -399,9 +335,7 @@ def load_adapted_x_model(
     covariate_dim: int,
     hidden_dim: int = 256,
     freeze_pretrained: bool = True,
-    num_samples: int = 20,
-    temperature: float = 1.0,
-    top_k: int = None,
+    specific_model_config: Dict[str, Any] = {},
     **model_kwargs
 ) -> AdaptedXModel:
     """
@@ -410,7 +344,7 @@ def load_adapted_x_model(
    
     if model_type.lower() == "chronos":
         base_model = load_chronos_model(model_name_or_path, **model_kwargs)
-        model_wrapper = ChronosWrapper(base_model)
+        model_wrapper = ChronosWrapper(base_model, specific_model_config)
     elif model_type.lower() == "chronos_bolt":
         base_model = load_chronos_bolt_model(model_name_or_path, **model_kwargs)
         model_wrapper = ChronosBoltWrapper(base_model)
@@ -428,9 +362,6 @@ def load_adapted_x_model(
         covariate_dim=covariate_dim,
         hidden_dim=hidden_dim,
         freeze_pretrained=freeze_pretrained,
-        num_samples=num_samples,
-        temperature=temperature,
-        top_k=top_k,
         **model_kwargs
     )
     
@@ -477,10 +408,10 @@ def load_timesfm_model(model_name_or_path: str, **kwargs):
 # # Example usage
 # def example_usage():
 #     """Example showing universal usage"""
-    
+
 #     # Load different models with covariates
 #     models = {}
-    
+
 #     # Chronos model
 #     try:
 #         models['chronos'] = load_adapted_x_model(
@@ -491,7 +422,7 @@ def load_timesfm_model(model_name_or_path: str, **kwargs):
 #         print("✅ Loaded Chronos model")
 #     except Exception as e:
 #         print(f"❌ Failed to load Chronos: {e}")
-    
+
 #     # ChronosBolt model
 #     try:
 #         models['chronos_bolt'] = load_adapted_x_model(
@@ -502,7 +433,7 @@ def load_timesfm_model(model_name_or_path: str, **kwargs):
 #         print("✅ Loaded ChronosBolt model")
 #     except Exception as e:
 #         print(f"❌ Failed to load ChronosBolt: {e.with_traceback()}")
-    
+
 #     # TimesFM model
 #     try:
 #         models['timesfm'] = load_adapted_x_model(
@@ -513,7 +444,7 @@ def load_timesfm_model(model_name_or_path: str, **kwargs):
 #         print("✅ Loaded TimesFM model")
 #     except Exception as e:
 #         print(f"❌ Failed to load TimesFM: {e}")
-    
+
 #     # Save and load
 #     # for name, model in models.items():
 #     #     save_path = f"./my_{name}_model"
