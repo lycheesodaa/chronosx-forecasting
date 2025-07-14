@@ -68,6 +68,7 @@ class AdaptedXModelEvaluator:
                     batch_predictions = []
                     outputs = self.model(
                         input_data=batch["input_data"],
+                        labels=batch["target"],
                         mask=batch["mask"],
                         past_covariates=batch["past_covariates"],
                         future_covariates=batch["future_covariates"],
@@ -282,6 +283,7 @@ class AdaptedXModelEvaluator:
                 for _ in range(num_samples):
                     outputs = self.model(
                         input_data=batch["input_data"],
+                        labels=batch["target"],
                         mask=batch["mask"],
                         past_covariates=batch["past_covariates"],
                         future_covariates=batch["future_covariates"],

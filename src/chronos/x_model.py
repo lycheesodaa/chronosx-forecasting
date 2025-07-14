@@ -6,6 +6,7 @@ import logging
 import json
 import os
 from transformers import AutoModel
+from transformers.modeling_outputs import Seq2SeqLMOutput
 
 from .x_wrapper import ModelWrapper, ChronosWrapper, ChronosBoltWrapper, TimesFMWrapper
 
@@ -202,6 +203,7 @@ class AdaptedXModel(nn.Module):
 
     def forward(self, 
                 input_data: torch.Tensor,
+                labels: torch.Tensor,
                 mask: Optional[torch.Tensor] = None,
                 past_covariates: Optional[torch.Tensor] = None,
                 future_covariates: Optional[torch.Tensor] = None,
@@ -227,8 +229,12 @@ class AdaptedXModel(nn.Module):
         )
 
         # Forward pass through pretrained model
-        sequences, hidden_states, logits = self.model_wrapper.forward_with_embeddings(
-            input_data, embeddings, **kwargs
+        decoder_input_ids, decoder_attention_mask = self.model_wrapper.encode(labels)
+        hidden_states, logits = self.model_wrapper.forward_with_embeddings(
+            input_data, labels, mask, embeddings, 
+            decoder_input_ids=decoder_input_ids, 
+            decoder_attention_mask=decoder_attention_mask,
+            **kwargs
         )
 
         # Apply Output Injection Block if future covariates provided
@@ -238,12 +244,146 @@ class AdaptedXModel(nn.Module):
                 hidden_states, future_covariates, logits
             )
 
-        # Need to convert logits back into outputs
-        outputs = self.model_wrapper.post_processing(
-            sequences, hidden_states, logits
+        # Calculate loss
+        loss_fn = nn.CrossEntropyLoss()
+        loss = loss_fn(logits.reshape(-1, logits.shape[-1]), decoder_input_ids.reshape(-1))
+
+        return Seq2SeqLMOutput(
+            loss=loss,
+            logits=logits,
         )
 
-        return outputs
+    def generate(self, input_ids: torch.Tensor, 
+                 attention_mask: Optional[torch.Tensor] = None,
+                 scale: Optional[torch.Tensor] = None,
+                 past_covariates: Optional[torch.Tensor] = None,
+                 future_covariates: Optional[torch.Tensor] = None,
+                 num_samples: int = 20,
+                 max_length: int = 64,
+                 **generation_kwargs) -> torch.Tensor:
+        """Generate outputs using the model"""
+        if self.model_type not in ['chronos', 'chronosbolt']:
+            raise ValueError(f"Model type {self.model_type} does not support .generate() method")
+
+        # If no adapters or covariates, use standard generation
+        if (self.input_injection_block is None or past_covariates is None) and (
+            self.output_injection_block is None or future_covariates is None
+        ):
+            generated_ids = self.model_wrapper.model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_length=max_length,
+                num_return_sequences=num_samples,
+                **generation_kwargs,
+            )
+
+            # Convert generated IDs back to tokens
+            predictions = self.tokenizer.output_transform(
+                generated_ids.to(scale.device), scale
+            )
+
+            return predictions
+
+        # Step 1: Process encoder with input injection if available - assumed always available
+        encoder_embeddings = self.model_wrapper.get_input_embeddings(input_ids)
+        modified_embeddings = self.covariate_adapter.inject_input_covariates(
+            encoder_embeddings, past_covariates
+        )
+        encoder_outputs = self.model_wrapper._run_encoder_with_embeddings(
+            embeddings=modified_embeddings, attention_mask=attention_mask
+        )
+
+        # Expand encoder outputs for multiple return sequences
+        if num_samples > 1:
+            encoder_hidden_states = encoder_outputs.last_hidden_state.repeat_interleave(
+                num_samples, dim=0
+            )
+            encoder_attention_mask = (
+                attention_mask.repeat_interleave(num_samples, dim=0)
+                if attention_mask is not None
+                else None
+            )
+        else:
+            encoder_hidden_states = encoder_outputs.last_hidden_state
+            encoder_attention_mask = attention_mask
+
+        # Step 3: Autoregressive generation with output injection
+        for step in range(max_length - 1):  # -1 because we start with one token
+            # Decoder forward pass
+            decoder_outputs = self.model_wrapper.model.model.decoder(
+                input_ids=self.model.model.prepare_decoder_input_ids_from_labels(labels),
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_attention_mask=encoder_attention_mask,
+                use_cache=True,
+            )
+
+            # Get hidden states for current step
+            current_hidden_states = decoder_outputs.hidden_states[-1][:, -1:, :]  # last token, last layer
+
+            # Apply output injection if available
+            if self.output_injection_block is not None and future_covariates is not None:
+                # Expand future covariates for multiple return sequences
+                if num_samples > 1:
+                    future_covariates = future_covariates.repeat_interleave(
+                        num_samples, dim=0
+                    )
+
+                # Get corresponding future covariate for current step
+                # Assumes that only future covariates after the predicted tokens are used, so perpetually size 1
+                current_future_cov = future_covariates[
+                    :, step : step + 1, :
+                ]  # (batch, 1, cov_dim)
+                logit_adjustment = self.output_injection_block(
+                    current_hidden_states, current_future_cov
+                )
+                adjusted_hidden_states = current_hidden_states + logit_adjustment
+            else:
+                adjusted_hidden_states = current_hidden_states
+
+            # Generate logits
+            next_token_logits = self.model_wrapper.post_processing(adjusted_hidden_states, None)
+
+            # Apply generation strategy (greedy, sampling, etc.)
+            if self.model_wrapper.model.config.get("do_sample", False):
+                # Apply temperature and top_k/top_p if sampling
+                if (
+                    "temperature" in self.model_wrapper.model.config
+                    and self.model_wrapper.model.config["temperature"] != 1.0
+                ):
+                    next_token_logits = next_token_logits / self.model_wrapper.model.config["temperature"]
+
+                if "top_k" in self.model_wrapper.model.config:
+                    top_k = self.model_wrapper.model.config["top_k"]
+                    indices_to_remove = (
+                        next_token_logits
+                        < torch.topk(next_token_logits, top_k)[0][..., -1, None]
+                    )
+                    next_token_logits[indices_to_remove] = float("-inf")
+
+                probs = torch.softmax(next_token_logits, dim=-1)
+                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+            else:
+                # Greedy selection
+                next_tokens = torch.argmax(next_token_logits, dim=-1)
+
+            # Append to generated sequence
+            generated_ids = torch.cat([generated_ids, next_tokens.unsqueeze(1)], dim=1)
+
+            # Check for EOS token (optional early stopping)
+            eos_token_id = self.model_wrapper.model.model.config.eos_token_id
+            if eos_token_id is not None:
+                if (next_tokens == eos_token_id).all():
+                    break
+
+        # Remove decoder start token
+        generated_ids = generated_ids[:, 1:]
+
+        # Convert generated IDs back to tokens
+        predictions = self.tokenizer.output_transform(
+            generated_ids.to(scale.device), scale
+        )
+
+        return predictions
 
     def to(self, device: Union[torch.device, str], **kwargs):
         """Moves all model parameters and buffers to the specified device.

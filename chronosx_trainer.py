@@ -91,26 +91,6 @@ class AdaptedXModelTrainer:
 
         return collated
 
-    def _compute_loss(self, outputs, targets):
-        """Compute training loss. This is a simplified version - adapt based on your model's output format."""
-        if hasattr(outputs, "logits"):
-            predictions = outputs.logits
-        elif hasattr(outputs, "outputs"):
-            predictions = outputs.outputs
-        else:
-            predictions = outputs
-
-        # Reshape if needed to match target dimensions
-        if len(predictions.shape) == 3 and len(targets.shape) == 2:
-            # Average across the sequence dimension or take the last prediction
-            predictions = predictions.mean(dim=1)
-
-        assert predictions.device == targets.device
-
-        # TODO implement loss function determined by model type
-        loss = nn.CrossEntropyLoss()(predictions, targets) # Chronos uses cross entropy
-        return loss
-
     def train_epoch(self):
         """Train for one epoch."""
         self.model.train()
@@ -131,13 +111,14 @@ class AdaptedXModelTrainer:
                 # Forward pass
                 outputs = self.model(
                     input_data=batch["input_data"],
+                    labels=batch["target"],
                     mask=batch["mask"],
                     past_covariates=batch["past_covariates"],
                     future_covariates=batch["future_covariates"],
                 )
 
                 # Compute loss
-                loss = self._compute_loss(outputs, batch["target"])
+                loss = outputs.loss
 
                 # Backward pass
                 loss.backward()
@@ -179,12 +160,13 @@ class AdaptedXModelTrainer:
                 try:
                     outputs = self.model(
                         input_data=batch["input_data"],
+                        labels=batch["target"],
                         mask=batch["mask"],
                         past_covariates=batch["past_covariates"],
                         future_covariates=batch["future_covariates"],
                     )
 
-                    loss = self._compute_loss(outputs, batch["target"])
+                    loss = outputs.loss
                     epoch_loss += loss.item()
                     num_batches += 1
 

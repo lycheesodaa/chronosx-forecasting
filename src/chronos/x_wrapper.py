@@ -7,8 +7,6 @@ import torch.nn as nn
 from typing import Any, Tuple, Optional
 from abc import ABC, abstractmethod
 
-from transformers import GenerationConfig
-
 class ModelWrapper(ABC):
     """Abstract base class for model wrappers"""
     
@@ -36,7 +34,7 @@ class ModelWrapper(ABC):
         pass
 
     @abstractmethod
-    def embed_tokens(self, token_ids: torch.Tensor) -> torch.Tensor:
+    def encode(self, context: torch.Tensor) -> torch.Tensor:
         """Pass to the underlying embed tokens function"""
         pass
     
@@ -64,8 +62,8 @@ class ModelWrapper(ABC):
         pass
 
     @abstractmethod
-    def post_processing(self, sequences: torch.Tensor, hidden_states: torch.Tensor, 
-                        logits: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    def post_processing(self, hidden_states: torch.Tensor, 
+                        logits: torch.Tensor) -> torch.Tensor:
         """
         Performing any necessary processing e.g. converting logits back into outputs
         """
@@ -107,12 +105,14 @@ class ChronosWrapper(ModelWrapper):
         config = self.model.config
         return config.prediction_length
 
-    def embed_tokens(self, token_ids: torch.Tensor) -> torch.Tensor:
-        """Pass to the underlying embed tokens function"""
-        if hasattr(self.model.model, 'encoder'):
-            return self.model.model.encoder.embed_tokens(token_ids)
-        else:
-            return self.model.model.embed_tokens(token_ids)
+    def encode(self, context: torch.Tensor) -> torch.Tensor:
+        """Pass to the underlying encode function"""
+        context = context.to(self.tokenizer.boundaries.device)
+        context_tensor = self.chronos_pipeline._prepare_and_validate_context(context=context)
+        token_ids, attention_mask, _ = self.tokenizer.context_input_transform(context_tensor)
+        token_ids = token_ids.to(self.model.device)
+        attention_mask = attention_mask.to(self.model.device)
+        return token_ids, attention_mask
 
     def get_input_embeddings(self, input_data: torch.Tensor, **kwargs) -> Tuple[torch.Tensor, Any]:
         """Get input embeddings from Chronos tokenizer and model"""
@@ -122,71 +122,60 @@ class ChronosWrapper(ModelWrapper):
 
         return embeddings
 
-    def forward_with_embeddings(self, input_data: torch.Tensor, embeddings: torch.Tensor, 
-                               **kwargs) -> Tuple[torch.Tensor, Tuple[torch.Tensor], torch.Tensor]:
+    def forward_with_embeddings(self, input_data: torch.Tensor, 
+                                labels: torch.Tensor,
+                                attention_mask: torch.Tensor,
+                                embeddings: torch.Tensor,
+                                decoder_input_ids: Optional[torch.Tensor] = None,
+                                decoder_attention_mask: Optional[torch.Tensor] = None,
+                                **kwargs) -> torch.Tensor:
         """Forward pass with custom embeddings"""
-        input_data = input_data.to(self.tokenizer.boundaries.device)
-        input_ids, attention_mask, scale = self.tokenizer.context_input_transform(
-            input_data
-        )
-        input_ids = input_ids.to(self.model.device)
-        attention_mask = attention_mask.to(self.model.device)
-        self.scale = scale
-
-        assert hasattr(self.model.model, "generate")
-
-        sequences = self.model.model.generate(
-            inputs_embeds=embeddings,
+        encoder_outputs = self._run_encoder_with_embeddings(
+            embeddings=embeddings,
             attention_mask=attention_mask,
-            generation_config=GenerationConfig(
-                min_new_tokens=self.model.config.prediction_length,
-                max_new_tokens=self.model.config.prediction_length,
-                do_sample=True,
-                num_return_sequences=self.model.config.num_samples,
-                eos_token_id=self.model.config.eos_token_id,
-                pad_token_id=self.model.config.pad_token_id,
-                temperature=self.model.config.temperature,
-                top_k=self.model.config.top_k,
-                top_p=self.model.config.top_p,
-                output_hidden_states=True,
-                output_logits=True,
-                return_dict_in_generate=True,
-            ),
         )
 
-        sequences = outputs.sequences
-        hidden_states = outputs.decoder_hidden_states
-        logits = outputs.logits
+        decoder_outputs = self.model.model.decoder(
+            input_ids=decoder_input_ids,
+            attention_mask=decoder_attention_mask,
+            encoder_hidden_states=encoder_outputs.last_hidden_state,
+            encoder_attention_mask=attention_mask,
+        )
 
-        if self.model.config.model_type == "seq2seq":
-            sequences = sequences[..., 1:]  # remove the decoder start token
-        else:
-            assert self.model.config.model_type == "causal"
-            assert sequences.size(-1) == input_ids.size(-1) + self.model.config.prediction_length
-            sequences = sequences[..., -self.model.config.prediction_length:]
+        logits = self.post_processing(decoder_outputs.last_hidden_state)
 
-        sequences = sequences.reshape(input_ids.size(0), self.model.config.num_samples, -1)
+        return decoder_outputs.last_hidden_state, logits
 
-        # TODO bother with the hidden states and logits when you need the OIB
-        # hidden_states = hidden_states.reshape(input_ids.size(0), self.model.config.num_samples, -1)
-        # logits = logits.reshape(input_ids.size(0), self.model.config.num_samples, -1)
+    def _run_encoder_with_embeddings(self, embeddings: torch.Tensor, attention_mask: Optional[torch.Tensor] = None):
+        """
+        Run T5 encoder with custom embeddings instead of token IDs
+        """
+        encoder = self.model.model.encoder
 
-        # print("sequences.shape", sequences.shape)
-        # print("hidden_states.shape", len(hidden_states), len(hidden_states[0]), hidden_states[0][0].shape)
-        # print("logits.shape", len(logits), logits[0].shape)
+        # Apply dropout to embeddings
+        embeddings = encoder.dropout(embeddings)
 
-        return sequences, hidden_states, logits
+        # Run through encoder stack
+        encoder_outputs = encoder(
+            inputs_embeds=embeddings,  # Use embeddings instead of input_ids
+            attention_mask=attention_mask,
+        )
 
-    def post_processing(self, sequences: torch.Tensor, hidden_states: torch.Tensor, 
-                        logits: torch.Tensor) -> torch.Tensor:
+        return encoder_outputs
+
+    def post_processing(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """
         Performing any necessary processing e.g. converting logits back into outputs
         """
-        output = self.tokenizer.output_transform(
-            sequences.to(self.scale.device), self.scale
-        )
+        # Generate logits
+        if self.model.model.config.tie_word_embeddings:
+            hidden_states = hidden_states * (
+                self.model.model.model_dim**-0.5
+            )
 
-        return output.to(self.model.device).median(dim=1)
+        logits = self.model.model.lm_head(hidden_states).squeeze(1)  # (batch, vocab_size)
+
+        return logits
 
 
 class ChronosBoltWrapper(ModelWrapper):

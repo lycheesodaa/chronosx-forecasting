@@ -234,9 +234,9 @@ if __name__ == "__main__":
     training_config = {
         "learning_rate": 1e-3,
         "batch_size": 16,
-        "num_epochs": 50,
+        "num_epochs": 100,
         "context_length": 512,
-        "prediction_length": 64,
+        "prediction_length": 48,
         "device": "cuda" if torch.cuda.is_available() else "cpu",
         "save_dir": "./experiment_results",
         "patience": 10,
