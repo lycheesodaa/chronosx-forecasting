@@ -229,7 +229,7 @@ class AdaptedXModel(nn.Module):
         )
 
         # Forward pass through pretrained model
-        decoder_input_ids, decoder_attention_mask = self.model_wrapper.encode(labels)
+        decoder_input_ids, decoder_attention_mask, _ = self.model_wrapper.input_transform(labels)
         hidden_states, logits = self.model_wrapper.forward_with_embeddings(
             input_data, labels, mask, embeddings, 
             decoder_input_ids=decoder_input_ids, 
@@ -266,26 +266,25 @@ class AdaptedXModel(nn.Module):
             raise ValueError(f"Model type {self.model_type} does not support .generate() method")
 
         # If no adapters or covariates, use standard generation
-        if (self.input_injection_block is None or past_covariates is None) and (
-            self.output_injection_block is None or future_covariates is None
-        ):
-            generated_ids = self.model_wrapper.model.generate(
+        if past_covariates is None and future_covariates is None:
+            print("Using standard generation without covariates")
+            generated_ids = self.model_wrapper.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                max_length=max_length,
-                num_return_sequences=num_samples,
+                prediction_length=max_length,
+                num_samples=num_samples,
                 **generation_kwargs,
             )
 
             # Convert generated IDs back to tokens
-            predictions = self.tokenizer.output_transform(
-                generated_ids.to(scale.device), scale
+            predictions = self.model_wrapper.tokenizer.output_transform(
+                generated_ids.to("cpu"), scale.to("cpu")
             )
 
             return predictions
 
         # Step 1: Process encoder with input injection if available - assumed always available
-        encoder_embeddings = self.model_wrapper.get_input_embeddings(input_ids)
+        encoder_embeddings = self.model_wrapper.model.encode(input_ids, attention_mask)
         modified_embeddings = self.covariate_adapter.inject_input_covariates(
             encoder_embeddings, past_covariates
         )
@@ -320,6 +319,9 @@ class AdaptedXModel(nn.Module):
             # Get hidden states for current step
             current_hidden_states = decoder_outputs.hidden_states[-1][:, -1:, :]  # last token, last layer
 
+            # Generate logits
+            next_token_logits = self.model_wrapper.post_processing(current_hidden_states)
+
             # Apply output injection if available
             if self.output_injection_block is not None and future_covariates is not None:
                 # Expand future covariates for multiple return sequences
@@ -333,15 +335,9 @@ class AdaptedXModel(nn.Module):
                 current_future_cov = future_covariates[
                     :, step : step + 1, :
                 ]  # (batch, 1, cov_dim)
-                logit_adjustment = self.output_injection_block(
-                    current_hidden_states, current_future_cov
+                next_token_logits = self.covariate_adapter.inject_output_covariates(
+                    current_hidden_states, current_future_cov, next_token_logits
                 )
-                adjusted_hidden_states = current_hidden_states + logit_adjustment
-            else:
-                adjusted_hidden_states = current_hidden_states
-
-            # Generate logits
-            next_token_logits = self.model_wrapper.post_processing(adjusted_hidden_states, None)
 
             # Apply generation strategy (greedy, sampling, etc.)
             if self.model_wrapper.model.config.get("do_sample", False):
@@ -379,9 +375,11 @@ class AdaptedXModel(nn.Module):
         generated_ids = generated_ids[:, 1:]
 
         # Convert generated IDs back to tokens
-        predictions = self.tokenizer.output_transform(
-            generated_ids.to(scale.device), scale
+        predictions = self.model_wrapper.tokenizer.output_transform(
+            generated_ids.to("cpu"), scale.to("cpu")
         )
+
+        print('generated predictions shape', predictions.shape)
 
         return predictions
 

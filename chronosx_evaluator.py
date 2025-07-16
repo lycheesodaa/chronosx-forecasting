@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import mean_absolute_error, mean_squared_error, mean_absolute_percentage_error
 
 from chronosx_covariate_ds import TimeSeriesCovariateDataset
+from chronos.x_model import AdaptedXModel
 
 class AdaptedXModelEvaluator:
     """
@@ -16,7 +17,7 @@ class AdaptedXModelEvaluator:
 
     def __init__(
         self,
-        model: Any,  # AdaptedXModel
+        model: AdaptedXModel,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
     ):
         self.model = model.to(device)
@@ -38,7 +39,6 @@ class AdaptedXModelEvaluator:
         Args:
             test_dataset: Test dataset
             batch_size: Batch size for evaluation
-            num_samples: Number of samples for probabilistic evaluation
 
         Returns:
             Dictionary of evaluation metrics
@@ -66,12 +66,15 @@ class AdaptedXModelEvaluator:
                 try:
                     # Generate multiple samples for probabilistic evaluation
                     batch_predictions = []
-                    outputs = self.model(
-                        input_data=batch["input_data"],
-                        labels=batch["target"],
-                        mask=batch["mask"],
+                    input_ids, attention_mask, scale = self.model.model_wrapper.input_transform(batch["target"])
+                    outputs = self.model.generate(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        scale=scale,
                         past_covariates=batch["past_covariates"],
                         future_covariates=batch["future_covariates"],
+                        num_samples=self.model.model_wrapper.model.config.num_samples,
+                        max_length=self.model.model_wrapper.model.config.prediction_length,
                     )
 
                     # Extract predictions
@@ -81,21 +84,18 @@ class AdaptedXModelEvaluator:
                         preds = outputs.logits
                     else:
                         preds = outputs
-                    print(preds.shape)
 
                     # Handle shape mismatches
                     if len(preds.shape) == 3 and len(batch["target"].shape) == 2:
                         preds = preds.mean(dim=1)
 
                     batch_predictions.append(preds.cpu())
-                    print(batch_predictions.shape)
 
                     # Stack predictions: [num_samples, batch_size, prediction_length]
                     batch_predictions = torch.stack(batch_predictions)
                     targets = batch["target"].cpu()
 
                     all_predictions.append(batch_predictions)
-                    print(all_predictions.shape)
                     all_targets.append(targets)
 
                     # Calculate errors for this batch
@@ -104,7 +104,7 @@ class AdaptedXModelEvaluator:
                     all_errors.extend(batch_errors.tolist())
 
                 except Exception as e:
-                    self.logger.error(f"Error in evaluation step: {e}")
+                    self.logger.error(f"Error in evaluation step: {e.with_traceback()}")
                     continue
 
         # Concatenate all predictions and targets
@@ -254,6 +254,7 @@ class AdaptedXModelEvaluator:
 
         return results
 
+    # TODO rewrite this to generate plots based on pred and true array inputs
     def generate_forecast_plots(
         self,
         test_dataset: TimeSeriesCovariateDataset,
@@ -281,12 +282,15 @@ class AdaptedXModelEvaluator:
                 # Generate samples
                 samples = []
                 for _ in range(num_samples):
-                    outputs = self.model(
-                        input_data=batch["input_data"],
-                        labels=batch["target"],
-                        mask=batch["mask"],
+                    input_ids, attention_mask, scale = self.model.model_wrapper.encode(batch["target"])
+                    outputs = self.model.generate(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        scale=scale,
                         past_covariates=batch["past_covariates"],
                         future_covariates=batch["future_covariates"],
+                        num_samples=num_samples,
+                        max_length=self.model.model_wrapper.model.config.prediction_length,
                     )
 
                     if hasattr(outputs, "prediction_outputs"):

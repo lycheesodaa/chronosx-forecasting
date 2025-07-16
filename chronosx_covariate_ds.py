@@ -121,13 +121,9 @@ class TimeSeriesCovariateDataset(Dataset):
         self.future_covariates = None  # Not used in this implementation
 
         print(f"Target column: {self.target_column}")
-        print(
-            f"Covariate columns ({len(self.covariate_columns)}): {self.covariate_columns}"
-        )
+        print(f"Covariate columns ({len(self.covariate_columns)}): {self.covariate_columns}")
         print(f"Time series shape: {self.time_series.shape}")
-        print(
-            f"Past covariates shape: {self.past_covariates.shape if self.past_covariates is not None else None}"
-        )
+        print(f"Past covariates shape: {self.past_covariates.shape if self.past_covariates is not None else None}")
 
     def _create_overlapping_splits(self, train_ratio: float, val_ratio: float, test_ratio: float = None):
         """
@@ -143,14 +139,14 @@ class TimeSeriesCovariateDataset(Dataset):
         # Calculate split points for the PREDICTION portions only
         n_train_pred = int(n_total * train_ratio)
         n_val_pred = int(n_total * val_ratio)
-        n_test_pred = n_total - n_train_pred - n_val_pred
+        n_test_pred = int(n_total * test_ratio)
 
         # Define prediction regions (non-overlapping)
         train_pred_end = n_train_pred
         val_pred_start = train_pred_end
         val_pred_end = val_pred_start + n_val_pred
         test_pred_start = val_pred_end
-        test_pred_end = n_total
+        test_pred_end = test_pred_start + n_test_pred
 
         # Define full regions (including context overlap)
         # Training: from start, no extension needed
@@ -193,15 +189,9 @@ class TimeSeriesCovariateDataset(Dataset):
         }
 
         print(f"\nData split summary (total length: {n_total}):")
-        print(
-            f"  Train: Full=[{train_start}:{train_end}] ({train_end-train_start}), Pred=[0:{train_pred_end}] ({train_pred_end})"
-        )
-        print(
-            f"  Val:   Full=[{val_start}:{val_end}] ({val_end-val_start}), Pred=[{val_pred_start-val_start}:{val_end-val_start}] ({n_val_pred})"
-        )
-        print(
-            f"  Test:  Full=[{test_start}:{test_end}] ({test_end-test_start}), Pred=[{test_pred_start-test_start}:{test_end-test_start}] ({n_test_pred})"
-        )
+        print(f"  Train: Full=[{train_start}:{train_end}] ({train_end-train_start}), Pred=[0:{train_pred_end}] ({train_pred_end})")
+        print(f"  Val:   Full=[{val_start}:{val_end}] ({val_end-val_start}), Pred=[{val_pred_start-val_start}:{val_end-val_start}] ({n_val_pred})")
+        print(f"  Test:  Full=[{test_start}:{test_end}] ({test_end-test_start}), Pred=[{test_pred_start-test_start}:{test_end-test_start}] ({n_test_pred})")
 
         # Check for sufficient data
         for mode_name, info in self.split_info.items():
@@ -233,9 +223,7 @@ class TimeSeriesCovariateDataset(Dataset):
 
         print(f"Mode '{self.mode}' data extracted:")
         print(f"  Full range: [{start}:{end}] -> {self.mode_time_series.shape}")
-        print(
-            f"  Prediction range (relative): [{self.pred_start_rel}:{self.pred_end_rel}]"
-        )
+        print(f"  Prediction range (relative): [{self.pred_start_rel}:{self.pred_end_rel}]")
         if self.mode_past_covariates is not None:
             print(f"  Past covariates: {self.mode_past_covariates.shape}")
 

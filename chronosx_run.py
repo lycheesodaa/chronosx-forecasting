@@ -23,6 +23,7 @@ def run_full_experiment(
     model_config: Dict[str, Any],
     training_config: Dict[str, Any],
     data_config: Dict[str, Any],
+    evaluate_only: bool = False,
 ) -> Dict[str, Any]:
     """
     Run a complete training and evaluation experiment.
@@ -31,6 +32,7 @@ def run_full_experiment(
         model_config: Configuration for AdaptedXModel
         training_config: Training hyperparameters
         data_config: Data generation/loading configuration
+        evaluate_only: Whether to only evaluate the model
 
     Returns:
         Dictionary containing all results and metrics
@@ -67,24 +69,25 @@ def run_full_experiment(
         specific_model_config=model_config.get("specific_model_config", {}),
     )
 
-    # Initialize trainer
-    trainer = AdaptedXModelTrainer(
-        model=model,
-        train_dataset=train_dataset,
-        val_dataset=val_dataset,
-        learning_rate=training_config.get("learning_rate", 1e-3),
-        batch_size=training_config.get("batch_size", 32),
-        num_epochs=training_config.get("num_epochs", 50),
-        device=training_config.get(
-            "device", "cuda" if torch.cuda.is_available() else "cpu"
-        ),
-        save_dir=training_config.get("save_dir", "./checkpoints"),
-        patience=training_config.get("patience", 10),
-    )
+    if not evaluate_only:
+        # Initialize trainer
+        trainer = AdaptedXModelTrainer(
+            model=model,
+            train_dataset=train_dataset,
+            val_dataset=val_dataset,
+            learning_rate=training_config.get("learning_rate", 1e-3),
+            batch_size=training_config.get("batch_size", 32),
+            num_epochs=training_config.get("num_epochs", 50),
+            device=training_config.get(
+                "device", "cuda" if torch.cuda.is_available() else "cpu"
+            ),
+            save_dir=training_config.get("save_dir", "./checkpoints"),
+            patience=training_config.get("patience", 10),
+        )
 
-    # Train model
-    logger.info("Starting training...")
-    trainer.train()
+        # Train model
+        logger.info("Starting training...")
+        trainer.train()
 
     # Initialize evaluator
     logger.info("Starting evaluation...")
@@ -97,11 +100,11 @@ def run_full_experiment(
     )
 
     # Generate forecast plots
-    evaluator.generate_forecast_plots(
-        test_dataset,
-        num_series=5,
-        save_path=str(trainer.save_dir / "forecast_plots.png"),
-    )
+    # evaluator.generate_forecast_plots(
+    #     test_dataset,
+    #     num_series=5,
+    #     save_path=str(trainer.save_dir / "forecast_plots.png"),
+    # )
 
     # Export predictions and targets to a single pandas CSV
     predictions_df = pd.DataFrame({"predictions": predictions.flatten(), "targets": targets.flatten()})
@@ -226,15 +229,16 @@ if __name__ == "__main__":
         "covariate_dim": 7,
         "hidden_dim": 256,
         "freeze_pretrained": True,
-        "specific_model_config": {
+        "specific_model_config": {  # to override default chronosconfig arguments
             "num_samples": 50,
+            "prediction_length": 48,
         }
     }
 
     training_config = {
         "learning_rate": 1e-3,
         "batch_size": 16,
-        "num_epochs": 100,
+        "num_epochs": 1,
         "context_length": 512,
         "prediction_length": 48,
         "device": "cuda" if torch.cuda.is_available() else "cpu",
@@ -242,16 +246,16 @@ if __name__ == "__main__":
         "patience": 10,
     }
 
-    # data_config = {num
+    # data_config = {
     #     "data_path": "~/models/Time-LLM/dataset/demand/demand_data_all_cleaned_featsel.csv",
     #     "train_ratio": 0.6,  # 60% training
     #     "val_ratio": 0.2,  # 20% validation, 20% test (1 - 0.6 - 0.2 = 0.2)
     # }
     data_config = {
         "data_path": "~/models/Time-LLM/dataset/demand/demand_data_all_cleaned_featsel.csv",
-        "train_ratio": 0.2, # for testing purposes only
-        "val_ratio": 0.1,
-        "test_ratio": 0.1,
+        "train_ratio": 0.01, # for testing purposes only
+        "val_ratio": 0.01,
+        "test_ratio": 0.01,
     }
 
     # Run single experiment

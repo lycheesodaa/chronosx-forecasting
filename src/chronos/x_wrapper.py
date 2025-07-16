@@ -34,23 +34,22 @@ class ModelWrapper(ABC):
         pass
 
     @abstractmethod
-    def encode(self, context: torch.Tensor) -> torch.Tensor:
+    def input_transform(self, context: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Pass to the underlying embed tokens function"""
         pass
     
     @abstractmethod
-    def get_input_embeddings(self, input_data: torch.Tensor, **kwargs) -> Tuple[torch.Tensor, Any]:
+    def get_input_embeddings(self, input_data: torch.Tensor, **kwargs) -> torch.Tensor:
         """
         Convert input data to embeddings
         
         Returns:
             embeddings: Tensor of shape (batch_size, seq_len, d_model)
-            additional_info: Any additional information needed for forward pass
         """
         pass
     
     @abstractmethod
-    def forward_with_embeddings(self, embeddings: torch.Tensor, additional_info: Any, 
+    def forward_with_embeddings(self, embeddings: torch.Tensor, 
                                **kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass with custom embeddings
@@ -84,7 +83,9 @@ class ChronosWrapper(ModelWrapper):
         self.tokenizer = chronos_pipeline.tokenizer
         self.model = chronos_pipeline.model
 
+        # override default chronos config arguments here
         self.model.config.num_samples = specific_model_config.get("num_samples", 20)
+        self.model.config.prediction_length = specific_model_config.get("prediction_length", 64)
 
     def _get_base_model(self):
         """Return the underlying Chronos pipeline instance"""
@@ -105,16 +106,17 @@ class ChronosWrapper(ModelWrapper):
         config = self.model.config
         return config.prediction_length
 
-    def encode(self, context: torch.Tensor) -> torch.Tensor:
-        """Pass to the underlying encode function"""
+    def input_transform(self, context: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Pass to the underlying input_transform function"""
         context = context.to(self.tokenizer.boundaries.device)
         context_tensor = self.chronos_pipeline._prepare_and_validate_context(context=context)
-        token_ids, attention_mask, _ = self.tokenizer.context_input_transform(context_tensor)
+        token_ids, attention_mask, scale = self.tokenizer.context_input_transform(context_tensor)
         token_ids = token_ids.to(self.model.device)
         attention_mask = attention_mask.to(self.model.device)
-        return token_ids, attention_mask
+        scale = scale.to(self.model.device)
+        return token_ids, attention_mask, scale
 
-    def get_input_embeddings(self, input_data: torch.Tensor, **kwargs) -> Tuple[torch.Tensor, Any]:
+    def get_input_embeddings(self, input_data: torch.Tensor, **kwargs) -> torch.Tensor:
         """Get input embeddings from Chronos tokenizer and model"""
         input_data = input_data.to(self.tokenizer.boundaries.device)
         embeddings, _ = self.chronos_pipeline.embed(context=input_data)
@@ -128,7 +130,7 @@ class ChronosWrapper(ModelWrapper):
                                 embeddings: torch.Tensor,
                                 decoder_input_ids: Optional[torch.Tensor] = None,
                                 decoder_attention_mask: Optional[torch.Tensor] = None,
-                                **kwargs) -> torch.Tensor:
+                                **kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
         """Forward pass with custom embeddings"""
         encoder_outputs = self._run_encoder_with_embeddings(
             embeddings=embeddings,
