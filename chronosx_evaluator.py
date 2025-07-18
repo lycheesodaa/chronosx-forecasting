@@ -66,11 +66,9 @@ class AdaptedXModelEvaluator:
                 try:
                     # Generate multiple samples for probabilistic evaluation
                     batch_predictions = []
-                    input_ids, attention_mask, scale = self.model.model_wrapper.input_transform(batch["target"])
                     outputs = self.model.generate(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        scale=scale,
+                        input_data=batch["input_data"],
+                        labels=batch["target"],
                         past_covariates=batch["past_covariates"],
                         future_covariates=batch["future_covariates"],
                         num_samples=self.model.model_wrapper.model.config.num_samples,

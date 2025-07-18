@@ -253,9 +253,9 @@ if __name__ == "__main__":
     # }
     data_config = {
         "data_path": "~/models/Time-LLM/dataset/demand/demand_data_all_cleaned_featsel.csv",
-        "train_ratio": 0.01, # for testing purposes only
-        "val_ratio": 0.01,
-        "test_ratio": 0.01,
+        "train_ratio": 0.6, # for testing purposes only
+        "val_ratio": 0.2,
+        "test_ratio": 0.2,
     }
 
     # Run single experiment
